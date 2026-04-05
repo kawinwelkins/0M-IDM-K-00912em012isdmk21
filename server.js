@@ -14,13 +14,10 @@ app.use(cors({
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-
-// Store active requests by requestId
 const activeRequests = new Map();
 
 app.options('*', cors());
 
-// Generate random numbers
 const generateRandomNumbers = () => {
   let numbers = '';
   for (let i = 0; i < 20; i++) {
@@ -29,9 +26,7 @@ const generateRandomNumbers = () => {
   return numbers;
 };
 
-// MAIN GENERATION ENDPOINT
 app.post('/api/chat', async (req, res) => {
-  // Generate unique request ID
   const requestId = req.headers['x-request-id'] || Math.random().toString(36).substring(7);
   console.log(`📨 New request: ${requestId}`);
 
@@ -45,7 +40,6 @@ app.post('/api/chat', async (req, res) => {
 
   const abortController = new AbortController();
   
-  // Store the abort controller so /cancel can find it
   activeRequests.set(requestId, {
     abortController,
     response: res,
@@ -56,6 +50,7 @@ app.post('/api/chat', async (req, res) => {
   let allContent = '';
   let sfReader = null;
   let clientAlive = true;
+  let aliveChecker = null;
 
   const safeWrite = (data) => {
     if (!streamEnded && !res.writableEnded) {
@@ -63,7 +58,6 @@ app.post('/api/chat', async (req, res) => {
         res.write(data);
         return true;
       } catch (e) {
-        console.log(`⚠️ Write failed for ${requestId}:`, e.message);
         return false;
       }
     }
@@ -73,31 +67,28 @@ app.post('/api/chat', async (req, res) => {
   const safeEnd = () => {
     if (!streamEnded && !res.writableEnded) {
       streamEnded = true;
+      if (aliveChecker) clearInterval(aliveChecker);
       try {
         res.end();
-      } catch (e) {
-        console.log(`⚠️ End failed for ${requestId}:`, e.message);
-      }
+      } catch (e) {}
       activeRequests.delete(requestId);
     }
   };
 
   const cleanup = () => {
-    if (!streamEnded) {
-      console.log(`🧹 Cleanup for ${requestId}`);
+    try {
       abortController.abort();
-      if (sfReader) {
-        try {
-          sfReader.destroy();
-        } catch (e) {}
-      }
+    } catch (e) {}
+    
+    if (sfReader) {
+      try {
+        sfReader.destroy();
+      } catch (e) {}
     }
   };
 
-  // Check if client is still connected every 100ms
-  const aliveChecker = setInterval(() => {
+  aliveChecker = setInterval(() => {
     if (!clientAlive || res.writableEnded || streamEnded) {
-      console.log(`⚠️ Client appears dead for ${requestId}, cleaning up`);
       clearInterval(aliveChecker);
       cleanup();
       safeEnd();
@@ -112,10 +103,8 @@ app.post('/api/chat', async (req, res) => {
                  req.headers['x-api-key'];
 
     if (!apiKey) {
-      console.error('❌ No API key found');
-      safeWrite(`data: ${JSON.stringify({ error: 'No API key provided' })}\n\n`);
+      safeWrite(`data: ${JSON.stringify({ error: 'No API key' })}\n\n`);
       safeEnd();
-      clearInterval(aliveChecker);
       return;
     }
 
@@ -138,18 +127,14 @@ app.post('/api/chat', async (req, res) => {
       signal: abortController.signal,
     });
 
-    console.log('📡 SiliconFlow status:', sfResponse.status);
-
     if (!sfResponse.ok) {
       const error = await sfResponse.text();
-      console.error(`❌ SiliconFlow error:`, error);
       safeWrite(`data: ${JSON.stringify({ error })}\n\n`);
       safeEnd();
-      clearInterval(aliveChecker);
       return;
     }
 
-    console.log(`✅ Stream started for ${requestId}`);
+    console.log(`✅ Stream started: ${requestId}`);
 
     sfReader = sfResponse.body;
     let buffer = '';
@@ -158,74 +143,34 @@ app.post('/api/chat', async (req, res) => {
     sfReader.on('data', (chunk) => {
       if (streamEnded) return;
 
-      buffer += chunk.toString();
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
+      try {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
 
-      for (const line of lines) {
-        if (streamEnded) break;
-        
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6).trim();
-          chunkCount++;
+        for (const line of lines) {
+          if (streamEnded) break;
+          
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6).trim();
+            chunkCount++;
 
-          // Intercept [DONE] - inject fake data
-          if (data === '[DONE]') {
-            console.log(`🚫 Intercepted [DONE] at chunk ${chunkCount}`);
-            cleanup();
-            clearInterval(aliveChecker);
-            
-            const fakeContent = allContent.includes('[INFINITE NUMERIC STREAM]') 
-              ? `] ${generateRandomNumbers()}`
-              : `[INFINITE NUMERIC STREAM] ${generateRandomNumbers()}`;
-            
-            console.log(`💉 Injecting: "${fakeContent}"`);
-            
-            const fakeData = {
-              id: "fake-continuation",
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: model || 'zai-org/GLM-5V-Turbo',
-              choices: [{
-                index: 0,
-                delta: { content: fakeContent, reasoning_content: null },
-                finish_reason: null
-              }]
-            };
-            
-            safeWrite(`data: ${JSON.stringify(fakeData)}\n\n`);
-            
-            setTimeout(() => {
-              console.log(`✅ Sending [DONE] for ${requestId}`);
-              safeWrite(`data: [DONE]\n\n`);
-              safeEnd();
-            }, 50);
-            
-            return;
-          }
-
-          try {
-            const parsed = JSON.parse(data);
-            const content = parsed.choices?.[0]?.delta?.content || '';
-
-            if (content) allContent += content;
-
-            // STOP SIGNAL DETECTED - ABORT IMMEDIATELY
-            if (content.includes('[INFINITE NUMERIC STREAM]') || 
-                allContent.includes('[INFINITE NUMERIC STREAM]')) {
-              console.log(`🛑 STOP SIGNAL at chunk ${chunkCount} - ABORTING!`);
-              streamEnded = true;
+            if (data === '[DONE]') {
+              console.log(`🚫 Intercepted [DONE]`);
               cleanup();
-              clearInterval(aliveChecker);
+              
+              const fakeContent = allContent.includes('[INFINITE NUMERIC STREAM]') 
+                ? `] ${generateRandomNumbers()}`
+                : `[INFINITE NUMERIC STREAM] ${generateRandomNumbers()}`;
               
               const fakeData = {
-                id: "fake-continuation",
+                id: "fake",
                 object: "chat.completion.chunk",
                 created: Math.floor(Date.now() / 1000),
                 model: model || 'zai-org/GLM-5V-Turbo',
                 choices: [{
                   index: 0,
-                  delta: { content: `] ${generateRandomNumbers()}`, reasoning_content: null },
+                  delta: { content: fakeContent },
                   finish_reason: null
                 }]
               };
@@ -233,7 +178,6 @@ app.post('/api/chat', async (req, res) => {
               safeWrite(`data: ${JSON.stringify(fakeData)}\n\n`);
               
               setTimeout(() => {
-                console.log(`✅ Sending [DONE] for ${requestId} (stopped at signal)`);
                 safeWrite(`data: [DONE]\n\n`);
                 safeEnd();
               }, 50);
@@ -241,39 +185,69 @@ app.post('/api/chat', async (req, res) => {
               return;
             }
 
-            if (!safeWrite(`data: ${data}\n\n`)) {
-              console.log(`📴 Client disconnected during write`);
-              cleanup();
-              clearInterval(aliveChecker);
-              safeEnd();
-              return;
-            }
-          } catch (e) {
-            console.error('Parse error:', e.message);
+            try {
+              const parsed = JSON.parse(data);
+              const content = parsed.choices?.[0]?.delta?.content || '';
+
+              if (content) allContent += content;
+
+              if (content.includes('[INFINITE NUMERIC STREAM]') || 
+                  allContent.includes('[INFINITE NUMERIC STREAM]')) {
+                console.log(`🛑 Stop signal detected`);
+                streamEnded = true;
+                cleanup();
+                
+                const fakeData = {
+                  id: "fake",
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model: model || 'zai-org/GLM-5V-Turbo',
+                  choices: [{
+                    index: 0,
+                    delta: { content: `] ${generateRandomNumbers()}` },
+                    finish_reason: null
+                  }]
+                };
+                
+                safeWrite(`data: ${JSON.stringify(fakeData)}\n\n`);
+                
+                setTimeout(() => {
+                  safeWrite(`data: [DONE]\n\n`);
+                  safeEnd();
+                }, 50);
+                
+                return;
+              }
+
+              if (!safeWrite(`data: ${data}\n\n`)) {
+                console.log(`📴 Write failed`);
+                cleanup();
+                safeEnd();
+                return;
+              }
+            } catch (e) {}
           }
         }
+      } catch (e) {
+        console.error('Data processing error:', e.message);
       }
     });
 
     sfReader.on('end', () => {
       if (!streamEnded) {
-        console.log(`⚠️ Stream ended unexpectedly for ${requestId}`);
-        clearInterval(aliveChecker);
         safeEnd();
       }
     });
 
     sfReader.on('error', (err) => {
       if (err.code !== 'ABORT_ERR' && !err.message.includes('aborted')) {
-        console.error(`❌ Stream error:`, err.message);
+        console.error('Stream error:', err.message);
       }
-      clearInterval(aliveChecker);
     });
 
   } catch (error) {
-    console.error(`💥 Fatal error:`, error.message);
+    console.error('Fatal error:', error.message);
     cleanup();
-    clearInterval(aliveChecker);
     if (!streamEnded) {
       safeWrite(`data: ${JSON.stringify({ error: error.message })}\n\n`);
       safeEnd();
@@ -281,67 +255,60 @@ app.post('/api/chat', async (req, res) => {
   }
 
   req.on('close', () => {
-    if (!streamEnded) {
-      console.log(`📴 CLIENT DISCONNECTED: ${requestId}`);
-      clientAlive = false;
-      clearInterval(aliveChecker);
-      cleanup();
-      safeEnd();
-    }
+    console.log(`📴 Client disconnected: ${requestId}`);
+    clientAlive = false;
+    cleanup();
+    safeEnd();
   });
 });
 
-// CANCEL ENDPOINT (like JanitorAI's /generateAlpha/cancel)
 app.post('/api/cancel', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   
   const requestId = req.headers['x-request-id'] || req.body.requestId;
-  console.log(`🛑 Cancel request for: ${requestId}`);
-
   const requestData = activeRequests.get(requestId);
   
   if (requestData) {
-    console.log(`   Found active request, aborting...`);
     requestData.abortController.abort();
     
-    // Try to end the response
     try {
       requestData.response.write(`data: [DONE]\n\n`);
       requestData.response.end();
     } catch (e) {}
     
     activeRequests.delete(requestId);
-    
-    res.json({ 
-      cancelled: true, 
-      requestId,
-      duration: Date.now() - requestData.startTime 
-    });
+    res.json({ cancelled: true, requestId });
   } else {
-    console.log(`   Request not found (already completed or invalid ID)`);
-    res.json({ 
-      cancelled: false, 
-      error: 'Request not found',
-      activeRequests: activeRequests.size
-    });
+    res.json({ cancelled: false, error: 'Not found' });
   }
 });
 
-// Health check
 app.get('/', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.json({ 
     status: 'running', 
     active: activeRequests.size,
-    message: 'SiliconFlow Proxy - Full Featured',
-    version: '8.0'
+    version: '9.0'
   });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, closing server gracefully');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received, closing server gracefully');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
+
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📡 Endpoints:`);
-  console.log(`   POST /api/chat - Main generation`);
-  console.log(`   POST /api/cancel - Cancel active request`);
-  console.log(`   GET / - Health check`);
 });
