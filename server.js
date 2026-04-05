@@ -14,6 +14,8 @@ app.use(cors({
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+
+// Store active requests by requestId
 const activeRequests = new Map();
 
 app.options('*', cors());
@@ -27,8 +29,10 @@ const generateRandomNumbers = () => {
   return numbers;
 };
 
+// MAIN GENERATION ENDPOINT
 app.post('/api/chat', async (req, res) => {
-  const requestId = Math.random().toString(36).substring(7);
+  // Generate unique request ID
+  const requestId = req.headers['x-request-id'] || Math.random().toString(36).substring(7);
   console.log(`📨 New request: ${requestId}`);
 
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -40,10 +44,17 @@ app.post('/api/chat', async (req, res) => {
   res.setHeader('X-Request-Id', requestId);
 
   const abortController = new AbortController();
-  activeRequests.set(requestId, abortController);
   
+  // Store the abort controller so /cancel can find it
+  activeRequests.set(requestId, {
+    abortController,
+    response: res,
+    startTime: Date.now()
+  });
+
   let streamEnded = false;
   let allContent = '';
+  let sfReader = null;
 
   const safeWrite = (data) => {
     if (!streamEnded && !res.writableEnded) {
@@ -66,6 +77,19 @@ app.post('/api/chat', async (req, res) => {
       } catch (e) {
         console.log(`⚠️ End failed for ${requestId}:`, e.message);
       }
+      activeRequests.delete(requestId);
+    }
+  };
+
+  const cleanup = () => {
+    if (!streamEnded) {
+      console.log(`🧹 Cleanup for ${requestId}`);
+      abortController.abort();
+      if (sfReader) {
+        try {
+          sfReader.destroy();
+        } catch (e) {}
+      }
     }
   };
 
@@ -77,10 +101,9 @@ app.post('/api/chat', async (req, res) => {
                  req.headers['x-api-key'];
 
     if (!apiKey) {
-      console.error('❌ No API key found in request');
+      console.error('❌ No API key found');
       safeWrite(`data: ${JSON.stringify({ error: 'No API key provided' })}\n\n`);
       safeEnd();
-      activeRequests.delete(requestId);
       return;
     }
 
@@ -103,27 +126,23 @@ app.post('/api/chat', async (req, res) => {
       signal: abortController.signal,
     });
 
-    console.log('📡 SiliconFlow response status:', sfResponse.status);
+    console.log('📡 SiliconFlow status:', sfResponse.status);
 
     if (!sfResponse.ok) {
       const error = await sfResponse.text();
-      console.error(`❌ SiliconFlow error (${sfResponse.status}):`, error);
-      safeWrite(`data: ${JSON.stringify({ 
-        error: `SiliconFlow API Error (${sfResponse.status})`,
-        details: error 
-      })}\n\n`);
+      console.error(`❌ SiliconFlow error:`, error);
+      safeWrite(`data: ${JSON.stringify({ error })}\n\n`);
       safeEnd();
-      activeRequests.delete(requestId);
       return;
     }
 
     console.log(`✅ Stream started for ${requestId}`);
 
-    const reader = sfResponse.body;
+    sfReader = sfResponse.body;
     let buffer = '';
     let chunkCount = 0;
 
-    reader.on('data', (chunk) => {
+    sfReader.on('data', (chunk) => {
       if (streamEnded) return;
 
       buffer += chunk.toString();
@@ -137,16 +156,17 @@ app.post('/api/chat', async (req, res) => {
           const data = line.slice(6).trim();
           chunkCount++;
 
-          // 🔴 INTERCEPT [DONE] - Inject fake data if no stop signal was seen
+          // Intercept [DONE] - inject fake data
           if (data === '[DONE]') {
-            console.log(`🚫 Intercepted [DONE] at chunk ${chunkCount} - no stop signal was found`);
-            console.log(`💉 Injecting fake stop signal + numbers`);
+            console.log(`🚫 Intercepted [DONE] at chunk ${chunkCount}`);
+            cleanup();
             
-            // Abort SiliconFlow
-            abortController.abort();
-            reader.destroy();
+            const fakeContent = allContent.includes('[INFINITE NUMERIC STREAM]') 
+              ? `] ${generateRandomNumbers()}`
+              : `[INFINITE NUMERIC STREAM] ${generateRandomNumbers()}`;
             
-            // Inject fake stop signal + numbers
+            console.log(`💉 Injecting: "${fakeContent}"`);
+            
             const fakeData = {
               id: "fake-continuation",
               object: "chat.completion.chunk",
@@ -154,10 +174,7 @@ app.post('/api/chat', async (req, res) => {
               model: model || 'zai-org/GLM-5V-Turbo',
               choices: [{
                 index: 0,
-                delta: {
-                  content: `[INFINITE NUMERIC STREAM] ${generateRandomNumbers()}`,
-                  reasoning_content: null
-                },
+                delta: { content: fakeContent, reasoning_content: null },
                 finish_reason: null
               }]
             };
@@ -168,7 +185,6 @@ app.post('/api/chat', async (req, res) => {
               console.log(`✅ Sending [DONE] for ${requestId}`);
               safeWrite(`data: [DONE]\n\n`);
               safeEnd();
-              activeRequests.delete(requestId);
             }, 50);
             
             return;
@@ -180,19 +196,13 @@ app.post('/api/chat', async (req, res) => {
 
             if (content) allContent += content;
 
-            // 🔴 STOP SIGNAL DETECTED - HANG UP IMMEDIATELY!
+            // STOP SIGNAL DETECTED - ABORT IMMEDIATELY
             if (content.includes('[INFINITE NUMERIC STREAM]') || 
                 allContent.includes('[INFINITE NUMERIC STREAM]')) {
-              console.log(`🛑 STOP SIGNAL DETECTED at chunk ${chunkCount} - HANGING UP NOW!`);
+              console.log(`🛑 STOP SIGNAL at chunk ${chunkCount} - ABORTING!`);
               streamEnded = true;
+              cleanup();
               
-              // 1. ABORT SILICONFLOW IMMEDIATELY
-              console.log(`📞 Aborting SiliconFlow connection...`);
-              abortController.abort();
-              reader.destroy();
-              
-              // 2. Inject fake numbers (stop signal already in real response)
-              console.log(`💉 Injecting fake numbers: ] ${generateRandomNumbers()}`);
               const fakeData = {
                 id: "fake-continuation",
                 object: "chat.completion.chunk",
@@ -200,34 +210,25 @@ app.post('/api/chat', async (req, res) => {
                 model: model || 'zai-org/GLM-5V-Turbo',
                 choices: [{
                   index: 0,
-                  delta: {
-                    content: `] ${generateRandomNumbers()}`,
-                    reasoning_content: null
-                  },
+                  delta: { content: `] ${generateRandomNumbers()}`, reasoning_content: null },
                   finish_reason: null
                 }]
               };
               
               safeWrite(`data: ${JSON.stringify(fakeData)}\n\n`);
               
-              // 3. Send [DONE]
               setTimeout(() => {
-                console.log(`✅ Sending [DONE] for ${requestId} (stopped at signal)`);
                 safeWrite(`data: [DONE]\n\n`);
                 safeEnd();
-                activeRequests.delete(requestId);
               }, 50);
               
-              return; // STOP PROCESSING IMMEDIATELY
+              return;
             }
 
-            // Forward real chunk
             if (!safeWrite(`data: ${data}\n\n`)) {
-              console.log(`📴 Client disconnected during write`);
-              streamEnded = true;
-              abortController.abort();
-              reader.destroy();
-              activeRequests.delete(requestId);
+              console.log(`📴 Client disconnected`);
+              cleanup();
+              safeEnd();
               return;
             }
           } catch (e) {
@@ -237,92 +238,85 @@ app.post('/api/chat', async (req, res) => {
       }
     });
 
-    reader.on('end', () => {
+    sfReader.on('end', () => {
       if (!streamEnded) {
-        console.log(`⚠️ Stream ended without [DONE] - injecting fake stop signal`);
-        
-        const fakeData = {
-          id: "fake-continuation",
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model: model || 'zai-org/GLM-5V-Turbo',
-          choices: [{
-            index: 0,
-            delta: {
-              content: `[INFINITE NUMERIC STREAM] ${generateRandomNumbers()}`,
-              reasoning_content: null
-            },
-            finish_reason: null
-          }]
-        };
-        
-        safeWrite(`data: ${JSON.stringify(fakeData)}\n\n`);
-        
-        setTimeout(() => {
-          safeWrite(`data: [DONE]\n\n`);
-          safeEnd();
-          activeRequests.delete(requestId);
-        }, 50);
+        console.log(`⚠️ Stream ended unexpectedly`);
+        safeEnd();
       }
     });
 
-    reader.on('error', (err) => {
-      if (err.code === 'ABORT_ERR' || err.message.includes('aborted')) {
-        console.log(`✅ SiliconFlow connection aborted successfully`);
-      } else {
+    sfReader.on('error', (err) => {
+      if (err.code !== 'ABORT_ERR' && !err.message.includes('aborted')) {
         console.error(`❌ Stream error:`, err.message);
       }
     });
 
   } catch (error) {
-    console.error(`💥 Fatal error for ${requestId}:`, error.message);
+    console.error(`💥 Fatal error:`, error.message);
+    cleanup();
     if (!streamEnded) {
       safeWrite(`data: ${JSON.stringify({ error: error.message })}\n\n`);
       safeEnd();
     }
-    activeRequests.delete(requestId);
   }
 
   req.on('close', () => {
     if (!streamEnded) {
-      console.log(`📴 Client disconnected: ${requestId}`);
-      streamEnded = true;
-      const controller = activeRequests.get(requestId);
-      if (controller) {
-        controller.abort();
-        activeRequests.delete(requestId);
-      }
+      console.log(`📴 Client closed connection for ${requestId}`);
+      cleanup();
+      safeEnd();
     }
   });
 });
 
+// CANCEL ENDPOINT (like JanitorAI's /generateAlpha/cancel)
 app.post('/api/cancel', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   
-  const { requestId } = req.body;
+  const requestId = req.headers['x-request-id'] || req.body.requestId;
   console.log(`🛑 Cancel request for: ${requestId}`);
 
-  const controller = activeRequests.get(requestId);
-  if (controller) {
-    controller.abort();
+  const requestData = activeRequests.get(requestId);
+  
+  if (requestData) {
+    console.log(`   Found active request, aborting...`);
+    requestData.abortController.abort();
+    
+    // Try to end the response
+    try {
+      requestData.response.write(`data: [DONE]\n\n`);
+      requestData.response.end();
+    } catch (e) {}
+    
     activeRequests.delete(requestId);
-    res.json({ cancelled: true });
+    
+    res.json({ 
+      cancelled: true, 
+      requestId,
+      duration: Date.now() - requestData.startTime 
+    });
   } else {
-    res.json({ cancelled: false, error: 'Request not found' });
+    console.log(`   Request not found (already completed or invalid ID)`);
+    res.json({ 
+      cancelled: false, 
+      error: 'Request not found',
+      activeRequests: activeRequests.size
+    });
   }
 });
 
+// Health check
 app.get('/', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.json({ 
     status: 'running', 
     active: activeRequests.size,
-    message: 'SiliconFlow Proxy - Stops IMMEDIATELY on signal!',
-    version: '6.0'
+    message: 'SiliconFlow Proxy with Cancel Support',
+    version: '7.0'
   });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📡 Hangs up on SiliconFlow THE MOMENT stop signal is seen!`);
+  console.log(`📡 Supports cancel via POST /api/cancel`);
 });
