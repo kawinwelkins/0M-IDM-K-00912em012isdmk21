@@ -51,6 +51,7 @@ app.post('/api/chat', async (req, res) => {
   let sfReader = null;
   let clientAlive = true;
   let aliveChecker = null;
+  let lastChunkData = null; // Store last chunk to copy format
 
   const safeWrite = (data) => {
     if (!streamEnded && !res.writableEnded) {
@@ -79,14 +80,12 @@ app.post('/api/chat', async (req, res) => {
   const aggressiveCleanup = () => {
     console.log(`🧹 AGGRESSIVE CLEANUP for ${requestId}`);
     
-    // Abort 50 times to be absolutely sure
     for (let i = 0; i < 50; i++) {
       try {
         abortController.abort();
       } catch (e) {}
     }
     
-    // Destroy reader
     if (sfReader) {
       try {
         sfReader.destroy();
@@ -98,6 +97,26 @@ app.post('/api/chat', async (req, res) => {
     }
     
     console.log(`   ✅ Cleanup complete`);
+  };
+
+  const createFakeChunk = (content) => {
+    // Use last chunk as template if available
+    if (lastChunkData) {
+      const fakeChunk = JSON.parse(JSON.stringify(lastChunkData)); // Deep copy
+      fakeChunk.delta = { content: content, reasoning_content: null };
+      fakeChunk.finish_reason = null;
+      return fakeChunk;
+    }
+    
+    // Fallback format matching SiliconFlow
+    return {
+      index: 0,
+      delta: {
+        content: content,
+        reasoning_content: null
+      },
+      finish_reason: null
+    };
   };
 
   aliveChecker = setInterval(() => {
@@ -152,6 +171,8 @@ app.post('/api/chat', async (req, res) => {
     sfReader = sfResponse.body;
     let buffer = '';
     let chunkCount = 0;
+    let streamId = null;
+    let streamModel = model || 'zai-org/GLM-5V-Turbo';
 
     sfReader.on('data', (chunk) => {
       if (streamEnded) {
@@ -183,15 +204,13 @@ app.post('/api/chat', async (req, res) => {
               console.log(`💉 Injecting fake data: "${fakeContent.substring(0, 50)}..."`);
               
               const fakeData = {
-                id: "fake",
+                id: streamId || "fake-" + Date.now(),
                 object: "chat.completion.chunk",
                 created: Math.floor(Date.now() / 1000),
-                model: model || 'zai-org/GLM-5V-Turbo',
-                choices: [{
-                  index: 0,
-                  delta: { content: fakeContent },
-                  finish_reason: null
-                }]
+                model: streamModel,
+                choices: [createFakeChunk(fakeContent)],
+                system_fingerprint: "",
+                usage: lastChunkData?.usage || {}
               };
               
               safeWrite(`data: ${JSON.stringify(fakeData)}\n\n`);
@@ -207,6 +226,14 @@ app.post('/api/chat', async (req, res) => {
 
             try {
               const parsed = JSON.parse(data);
+              
+              // Capture stream metadata
+              if (parsed.id && !streamId) streamId = parsed.id;
+              if (parsed.model) streamModel = parsed.model;
+              if (parsed.choices && parsed.choices[0]) {
+                lastChunkData = parsed.choices[0];
+              }
+              
               const content = parsed.choices?.[0]?.delta?.content || '';
 
               if (content) allContent += content;
@@ -218,23 +245,22 @@ app.post('/api/chat', async (req, res) => {
                 console.log(`   Triggering IMMEDIATE abort...`);
                 streamEnded = true;
                 
-                // ABORT IMMEDIATELY
                 aggressiveCleanup();
                 
                 console.log(`   Injecting fake numbers...`);
                 const fakeData = {
-                  id: "fake",
+                  id: streamId || "fake-" + Date.now(),
                   object: "chat.completion.chunk",
                   created: Math.floor(Date.now() / 1000),
-                  model: model || 'zai-org/GLM-5V-Turbo',
-                  choices: [{
-                    index: 0,
-                    delta: { content: `] ${generateRandomNumbers()}` },
-                    finish_reason: null
-                  }]
+                  model: streamModel,
+                  choices: [createFakeChunk(`] ${generateRandomNumbers()}`)],
+                  system_fingerprint: "",
+                  usage: lastChunkData?.usage || {}
                 };
                 
-                safeWrite(`data: ${JSON.stringify(fakeData)}\n\n`);
+                const fakeDataStr = `data: ${JSON.stringify(fakeData)}\n\n`;
+                console.log(`   Fake data: ${fakeDataStr.substring(0, 100)}...`);
+                safeWrite(fakeDataStr);
                 
                 setTimeout(() => {
                   console.log(`   Sending [DONE] after stop signal`);
@@ -253,7 +279,9 @@ app.post('/api/chat', async (req, res) => {
                 safeEnd();
                 return;
               }
-            } catch (e) {}
+            } catch (e) {
+              console.error('Parse error:', e.message);
+            }
           }
         }
       } catch (e) {
@@ -320,7 +348,7 @@ app.get('/', (req, res) => {
   res.json({ 
     status: 'running', 
     active: activeRequests.size,
-    version: '10.0'
+    version: '11.0'
   });
 });
 
