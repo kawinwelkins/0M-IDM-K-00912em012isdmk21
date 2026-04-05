@@ -55,6 +55,7 @@ app.post('/api/chat', async (req, res) => {
   let streamEnded = false;
   let allContent = '';
   let sfReader = null;
+  let clientAlive = true;
 
   const safeWrite = (data) => {
     if (!streamEnded && !res.writableEnded) {
@@ -93,6 +94,16 @@ app.post('/api/chat', async (req, res) => {
     }
   };
 
+  // Check if client is still connected every 100ms
+  const aliveChecker = setInterval(() => {
+    if (!clientAlive || res.writableEnded || streamEnded) {
+      console.log(`⚠️ Client appears dead for ${requestId}, cleaning up`);
+      clearInterval(aliveChecker);
+      cleanup();
+      safeEnd();
+    }
+  }, 100);
+
   try {
     let apiKey = req.body.apiKey || 
                  req.body.api_key || 
@@ -104,6 +115,7 @@ app.post('/api/chat', async (req, res) => {
       console.error('❌ No API key found');
       safeWrite(`data: ${JSON.stringify({ error: 'No API key provided' })}\n\n`);
       safeEnd();
+      clearInterval(aliveChecker);
       return;
     }
 
@@ -133,6 +145,7 @@ app.post('/api/chat', async (req, res) => {
       console.error(`❌ SiliconFlow error:`, error);
       safeWrite(`data: ${JSON.stringify({ error })}\n\n`);
       safeEnd();
+      clearInterval(aliveChecker);
       return;
     }
 
@@ -160,6 +173,7 @@ app.post('/api/chat', async (req, res) => {
           if (data === '[DONE]') {
             console.log(`🚫 Intercepted [DONE] at chunk ${chunkCount}`);
             cleanup();
+            clearInterval(aliveChecker);
             
             const fakeContent = allContent.includes('[INFINITE NUMERIC STREAM]') 
               ? `] ${generateRandomNumbers()}`
@@ -202,6 +216,7 @@ app.post('/api/chat', async (req, res) => {
               console.log(`🛑 STOP SIGNAL at chunk ${chunkCount} - ABORTING!`);
               streamEnded = true;
               cleanup();
+              clearInterval(aliveChecker);
               
               const fakeData = {
                 id: "fake-continuation",
@@ -218,6 +233,7 @@ app.post('/api/chat', async (req, res) => {
               safeWrite(`data: ${JSON.stringify(fakeData)}\n\n`);
               
               setTimeout(() => {
+                console.log(`✅ Sending [DONE] for ${requestId} (stopped at signal)`);
                 safeWrite(`data: [DONE]\n\n`);
                 safeEnd();
               }, 50);
@@ -226,8 +242,9 @@ app.post('/api/chat', async (req, res) => {
             }
 
             if (!safeWrite(`data: ${data}\n\n`)) {
-              console.log(`📴 Client disconnected`);
+              console.log(`📴 Client disconnected during write`);
               cleanup();
+              clearInterval(aliveChecker);
               safeEnd();
               return;
             }
@@ -240,7 +257,8 @@ app.post('/api/chat', async (req, res) => {
 
     sfReader.on('end', () => {
       if (!streamEnded) {
-        console.log(`⚠️ Stream ended unexpectedly`);
+        console.log(`⚠️ Stream ended unexpectedly for ${requestId}`);
+        clearInterval(aliveChecker);
         safeEnd();
       }
     });
@@ -249,11 +267,13 @@ app.post('/api/chat', async (req, res) => {
       if (err.code !== 'ABORT_ERR' && !err.message.includes('aborted')) {
         console.error(`❌ Stream error:`, err.message);
       }
+      clearInterval(aliveChecker);
     });
 
   } catch (error) {
     console.error(`💥 Fatal error:`, error.message);
     cleanup();
+    clearInterval(aliveChecker);
     if (!streamEnded) {
       safeWrite(`data: ${JSON.stringify({ error: error.message })}\n\n`);
       safeEnd();
@@ -262,7 +282,9 @@ app.post('/api/chat', async (req, res) => {
 
   req.on('close', () => {
     if (!streamEnded) {
-      console.log(`📴 Client closed connection for ${requestId}`);
+      console.log(`📴 CLIENT DISCONNECTED: ${requestId}`);
+      clientAlive = false;
+      clearInterval(aliveChecker);
       cleanup();
       safeEnd();
     }
@@ -311,12 +333,15 @@ app.get('/', (req, res) => {
   res.json({ 
     status: 'running', 
     active: activeRequests.size,
-    message: 'SiliconFlow Proxy with Cancel Support',
-    version: '7.0'
+    message: 'SiliconFlow Proxy - Full Featured',
+    version: '8.0'
   });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📡 Supports cancel via POST /api/cancel`);
+  console.log(`📡 Endpoints:`);
+  console.log(`   POST /api/chat - Main generation`);
+  console.log(`   POST /api/cancel - Cancel active request`);
+  console.log(`   GET / - Health check`);
 });
