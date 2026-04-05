@@ -72,25 +72,38 @@ app.post('/api/chat', async (req, res) => {
         res.end();
       } catch (e) {}
       activeRequests.delete(requestId);
+      console.log(`✅ Response ended for ${requestId}`);
     }
   };
 
-  const cleanup = () => {
-    try {
-      abortController.abort();
-    } catch (e) {}
+  const aggressiveCleanup = () => {
+    console.log(`🧹 AGGRESSIVE CLEANUP for ${requestId}`);
     
+    // Abort 50 times to be absolutely sure
+    for (let i = 0; i < 50; i++) {
+      try {
+        abortController.abort();
+      } catch (e) {}
+    }
+    
+    // Destroy reader
     if (sfReader) {
       try {
         sfReader.destroy();
-      } catch (e) {}
+        sfReader.removeAllListeners();
+        console.log(`   ✅ Reader destroyed`);
+      } catch (e) {
+        console.log(`   ⚠️ Reader destroy failed:`, e.message);
+      }
     }
+    
+    console.log(`   ✅ Cleanup complete`);
   };
 
   aliveChecker = setInterval(() => {
     if (!clientAlive || res.writableEnded || streamEnded) {
       clearInterval(aliveChecker);
-      cleanup();
+      aggressiveCleanup();
       safeEnd();
     }
   }, 100);
@@ -141,7 +154,10 @@ app.post('/api/chat', async (req, res) => {
     let chunkCount = 0;
 
     sfReader.on('data', (chunk) => {
-      if (streamEnded) return;
+      if (streamEnded) {
+        console.log(`⚠️ Received data after stream ended (chunk ${chunkCount})`);
+        return;
+      }
 
       try {
         buffer += chunk.toString();
@@ -156,12 +172,15 @@ app.post('/api/chat', async (req, res) => {
             chunkCount++;
 
             if (data === '[DONE]') {
-              console.log(`🚫 Intercepted [DONE]`);
-              cleanup();
+              console.log(`🚫 Intercepted [DONE] at chunk ${chunkCount}`);
+              streamEnded = true;
+              aggressiveCleanup();
               
               const fakeContent = allContent.includes('[INFINITE NUMERIC STREAM]') 
                 ? `] ${generateRandomNumbers()}`
                 : `[INFINITE NUMERIC STREAM] ${generateRandomNumbers()}`;
+              
+              console.log(`💉 Injecting fake data: "${fakeContent.substring(0, 50)}..."`);
               
               const fakeData = {
                 id: "fake",
@@ -178,6 +197,7 @@ app.post('/api/chat', async (req, res) => {
               safeWrite(`data: ${JSON.stringify(fakeData)}\n\n`);
               
               setTimeout(() => {
+                console.log(`📤 Sending final [DONE]`);
                 safeWrite(`data: [DONE]\n\n`);
                 safeEnd();
               }, 50);
@@ -191,12 +211,17 @@ app.post('/api/chat', async (req, res) => {
 
               if (content) allContent += content;
 
+              // 🔴 STOP SIGNAL DETECTED
               if (content.includes('[INFINITE NUMERIC STREAM]') || 
                   allContent.includes('[INFINITE NUMERIC STREAM]')) {
-                console.log(`🛑 Stop signal detected`);
+                console.log(`🛑 Stop signal detected at chunk ${chunkCount}`);
+                console.log(`   Triggering IMMEDIATE abort...`);
                 streamEnded = true;
-                cleanup();
                 
+                // ABORT IMMEDIATELY
+                aggressiveCleanup();
+                
+                console.log(`   Injecting fake numbers...`);
                 const fakeData = {
                   id: "fake",
                   object: "chat.completion.chunk",
@@ -212,16 +237,19 @@ app.post('/api/chat', async (req, res) => {
                 safeWrite(`data: ${JSON.stringify(fakeData)}\n\n`);
                 
                 setTimeout(() => {
+                  console.log(`   Sending [DONE] after stop signal`);
                   safeWrite(`data: [DONE]\n\n`);
                   safeEnd();
                 }, 50);
                 
+                console.log(`   Stop signal handling complete`);
                 return;
               }
 
               if (!safeWrite(`data: ${data}\n\n`)) {
-                console.log(`📴 Write failed`);
-                cleanup();
+                console.log(`📴 Write failed - client gone`);
+                streamEnded = true;
+                aggressiveCleanup();
                 safeEnd();
                 return;
               }
@@ -234,20 +262,23 @@ app.post('/api/chat', async (req, res) => {
     });
 
     sfReader.on('end', () => {
+      console.log(`📭 SiliconFlow stream ended for ${requestId}`);
       if (!streamEnded) {
         safeEnd();
       }
     });
 
     sfReader.on('error', (err) => {
-      if (err.code !== 'ABORT_ERR' && !err.message.includes('aborted')) {
+      if (err.code === 'ABORT_ERR' || err.message.includes('aborted')) {
+        console.log(`✅ SiliconFlow stream aborted successfully`);
+      } else {
         console.error('Stream error:', err.message);
       }
     });
 
   } catch (error) {
     console.error('Fatal error:', error.message);
-    cleanup();
+    aggressiveCleanup();
     if (!streamEnded) {
       safeWrite(`data: ${JSON.stringify({ error: error.message })}\n\n`);
       safeEnd();
@@ -257,7 +288,7 @@ app.post('/api/chat', async (req, res) => {
   req.on('close', () => {
     console.log(`📴 Client disconnected: ${requestId}`);
     clientAlive = false;
-    cleanup();
+    aggressiveCleanup();
     safeEnd();
   });
 });
@@ -269,6 +300,7 @@ app.post('/api/cancel', (req, res) => {
   const requestData = activeRequests.get(requestId);
   
   if (requestData) {
+    console.log(`🛑 Manual cancel for ${requestId}`);
     requestData.abortController.abort();
     
     try {
@@ -288,23 +320,20 @@ app.get('/', (req, res) => {
   res.json({ 
     status: 'running', 
     active: activeRequests.size,
-    version: '9.0'
+    version: '10.0'
   });
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received, closing server gracefully');
+  console.log('SIGTERM received, closing server');
   server.close(() => {
-    console.log('Server closed');
     process.exit(0);
   });
 });
 
 process.on('SIGINT', () => {
-  console.log('SIGINT received, closing server gracefully');
+  console.log('SIGINT received, closing server');
   server.close(() => {
-    console.log('Server closed');
     process.exit(0);
   });
 });
